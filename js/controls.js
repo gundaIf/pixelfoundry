@@ -1,5 +1,5 @@
 // Builds parameter controls for a tool.
-import { h, pickFiles, fileToCanvas } from './dom.js';
+import { h, pickFiles, fileToCanvas, toast } from './dom.js';
 import { curveLut } from './tools/adjust.js';
 
 const fmtNum = (v, step) => (step < 1 ? (+v).toFixed(String(step).split('.')[1]?.length || 1) : String(Math.round(v)));
@@ -78,7 +78,13 @@ export function buildControls(tool, params, onChange, ctx = {}) {
         const unit = p.unit ? h('span.unit', {}, p.unit.trim()) : null;
         const set = (v, from) => { params[p.key] = +v; if (from !== r) r.value = v; if (from !== n) n.value = fmtNum(v, p.step); r.style.setProperty('--pct', ((v - p.min) / (p.max - p.min)) * 100 + '%'); };
         r.addEventListener('input', () => { set(r.value, r); emit(p); });
-        n.addEventListener('change', () => { const v = Math.min(p.max, Math.max(p.min, +n.value || 0)); set(v, null); emit(p); });
+        n.addEventListener('change', () => {
+          const raw = parseFloat(n.value);
+          if (!Number.isFinite(raw)) { set(params[p.key], null); return toast(`${p.label}: enter a number between ${p.min} and ${p.max}.`, 'warn'); }
+          const v = Math.min(p.max, Math.max(p.min, raw));
+          if (v !== raw) toast(`${p.label} must be between ${p.min} and ${p.max}${p.unit ? ' ' + p.unit.trim() : ''}, so it was set to ${fmtNum(v, p.step)}.`, 'warn');
+          set(v, null); emit(p);
+        });
         r.addEventListener('dblclick', () => { set(p.def, null); emit(p); });
         set(params[p.key]);
         syncers.push(() => set(params[p.key]));
@@ -87,7 +93,13 @@ export function buildControls(tool, params, onChange, ctx = {}) {
       }
       case 'number': {
         const n = h('input.num.wide', { type: 'number', min: p.min, max: p.max, value: params[p.key] });
-        n.addEventListener('change', () => { params[p.key] = Math.min(p.max, Math.max(p.min, Math.round(+n.value) || p.def)); n.value = params[p.key]; emit(p); });
+        n.addEventListener('change', () => {
+          const raw = Math.round(parseFloat(n.value));
+          if (!Number.isFinite(raw)) { n.value = params[p.key]; return toast(`${p.label}: enter a whole number between ${p.min} and ${p.max}.`, 'warn'); }
+          const v = Math.min(p.max, Math.max(p.min, raw));
+          if (v !== raw) toast(`${p.label} must be between ${p.min} and ${p.max}, so it was set to ${v}.`, 'warn');
+          params[p.key] = v; n.value = v; emit(p);
+        });
         syncers.push(() => { n.value = params[p.key]; });
         el = h('label.field', {}, label, n);
         break;

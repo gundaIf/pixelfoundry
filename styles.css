@@ -323,3 +323,13 @@ body.dropping #drop-hint { display: grid; }
   #empty { padding: 20px 16px; }
 }
 @media (min-width: 861px) { body.right-open #scrim { display: none; } }
+
+/* QA fixes */
+.toast { display: flex; align-items: center; gap: 12px; pointer-events: auto; }
+.toast.warn { border-color: color-mix(in srgb, var(--warn) 65%, transparent); }
+.toast-action { flex: none; height: 28px; padding: 0 10px; border-radius: 7px; border: 0; background: var(--accent); color: #fff; font-weight: 600; cursor: pointer; }
+#viewport.stale #canvas-wrap { opacity: 0.75; transition: opacity 0.2s; }
+.dialog-actions { justify-content: flex-end; margin-top: 16px; }
+.modal.small .input, .modal.small input.text { margin-top: 4px; }
+.callout:not(.warn) { background: var(--bg2); border: 1px solid var(--line); }
+:focus-visible { outline: 2px solid var(--accent2); outline-offset: 2px; }

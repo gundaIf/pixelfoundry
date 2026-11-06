@@ -84,7 +84,7 @@ export default [
         const exifr = await LIBS.exifr();
         const data = await (exifr.default || exifr).parse(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength), { tiff: true, exif: true, gps: true, iptc: true, xmp: true, icc: true, jfif: true, ihdr: true, mergeOutput: false, translateValues: true, reviveValues: true });
         box.innerHTML = '';
-        if (!data || !Object.keys(data).length) { box.append(h('p.muted', {}, 'No metadata found in this file. 🎉')); return; }
+        if (!data || !Object.values(data).some((v) => v && typeof v === 'object' && Object.keys(v).length)) { box.append(h('p.muted', {}, 'No EXIF, IPTC or XMP metadata was found in this file.')); return; }
         const gps = data.gps;
         if (gps && gps.latitude != null) {
           box.append(h('div.callout.warn', {}, '📍 This photo contains GPS location: ', h('b', {}, `${gps.latitude.toFixed(5)}, ${gps.longitude.toFixed(5)}`), ' — ', h('a', { href: `https://www.openstreetmap.org/?mlat=${gps.latitude}&mlon=${gps.longitude}#map=15/${gps.latitude}/${gps.longitude}`, target: '_blank', rel: 'noopener' }, 'view on map')));
@@ -99,7 +99,8 @@ export default [
         box.append(btn('Copy all as JSON', () => copyText(JSON.stringify(data, (k, v) => (v instanceof Uint8Array ? undefined : v), 2))));
       } catch (e) {
         box.innerHTML = '';
-        box.append(h('p.muted', {}, 'Could not read metadata: ' + e.message));
+        const unsupported = /unknown file format|not supported|invalid/i.test(e.message);
+        box.append(h('p.muted', {}, unsupported ? `No EXIF, IPTC or XMP metadata was found in this ${jpg ? 'JPEG' : png ? 'PNG' : (f.type || 'file').replace('image/', '').toUpperCase()} file.` : 'Could not read metadata: ' + e.message));
       }
     },
   },
@@ -360,8 +361,10 @@ export default [
     desc: 'Turn several images into an animated GIF with custom frame delay, size and looping.',
     mount(el, api) {
       const frames = [];
-      if (api.hasImage()) frames.push({ name: 'current', canvas: api.preview() });
-      const list = h('div.thumbs'), delay = h('input.num', { type: 'number', min: 20, max: 5000, value: 500 }), width = h('input.num', { type: 'number', min: 16, max: 1600, value: 480 });
+      const pending = api.takePendingGif();
+      if (pending) frames.push(...pending.frames);
+      else if (api.hasImage()) frames.push({ name: 'current', canvas: api.preview() });
+      const list = h('div.thumbs'), delay = h('input.num', { type: 'number', min: 20, max: 5000, value: pending ? Math.round(pending.frames.reduce((t, f) => t + (f.delay || 100), 0) / pending.frames.length) : 500 }), width = h('input.num', { type: 'number', min: 16, max: 1600, value: pending ? Math.min(1600, pending.frames[0].canvas.width) : 480 });
       const loop = h('input', { type: 'checkbox', checked: true }), bounce = h('input', { type: 'checkbox' }), colors = h('select', {}, [256, 128, 64, 32, 16].map((n) => h('option', { value: n }, n + ' colors')));
       const out = h('div.gif-out');
       const refresh = () => { list.innerHTML = ''; frames.forEach((f, i) => list.append(h('div.thumb', {}, h('img', { src: C.resizeCanvas(f.canvas, 80, 80 * f.canvas.height / f.canvas.width).toDataURL() }), h('span.idx', {}, i + 1), h('button.x', { onClick: () => { frames.splice(i, 1); refresh(); } }, '×')))); };
@@ -393,7 +396,7 @@ export default [
       if (needImage(api, el)) return;
       const lang = h('select', {}, [['eng', 'English'], ['deu', 'German'], ['fra', 'French'], ['spa', 'Spanish'], ['ita', 'Italian'], ['por', 'Portuguese'], ['nld', 'Dutch'], ['rus', 'Russian'], ['ukr', 'Ukrainian'], ['pol', 'Polish'], ['tur', 'Turkish'], ['chi_sim', 'Chinese (Simplified)'], ['jpn', 'Japanese'], ['kor', 'Korean'], ['ara', 'Arabic'], ['hin', 'Hindi']].map(([v, l]) => h('option', { value: v }, l)));
       const status = h('div.muted'), outText = h('textarea.ocr-out', { rows: 12, placeholder: 'Recognized text appears here…' });
-      el.append(h('label.field', {}, h('span', {}, 'Language'), lang), h('p.muted.small', {}, 'Tip: run “Clean Up Scanned Document” first for better accuracy. Language data (~2–10 MB) downloads once.'),
+      el.append(h('label.field', {}, h('span', {}, 'Language'), lang), h('div.callout', {}, 'OCR runs on your device, but the first run downloads the OCR engine and language data (about 2–10 MB) from cdn.jsdelivr.net. Your image is never sent anywhere.'), h('p.muted.small', {}, 'Tip: run “Clean Up Scanned Document” first for better accuracy.'),
         btn('Recognize text', async () => {
           status.textContent = 'Loading OCR engine…';
           try {

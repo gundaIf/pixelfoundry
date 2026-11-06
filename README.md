@@ -16,7 +16,7 @@ Then open http://localhost:5173. The app uses plain ES modules, so there's no bu
 
 | imgonline | PixelFoundry |
 |---|---|
-| Uploads each image to a server, which processes it and keeps it for 2 hours | Everything runs in the browser and nothing is uploaded |
+| Uploads each image to a server, which processes it and keeps it for 2 hours | Images are processed in the browser and never uploaded |
 | One tool per page: upload, fill a form, press OK, then download | Live preview as you drag sliders |
 | You can't chain edits without downloading and re-uploading | Applied tools stack up as editable steps you can hide, reorder, duplicate or re-edit |
 | No before/after view | Split view (C), hold `\` to see the original, and a histogram |
@@ -51,4 +51,11 @@ js/controls.js    controls generated from param descriptors (range, select, colo
 
 Each tool's `run(src, params, { s })` receives `s`, the ratio of preview size to real size. Tools multiply any pixel-based radius by `s`, so the preview matches the full-resolution export.
 
-Third-party libraries are loaded from a CDN only when a tool needs them: qrcode-generator, jsQR, JSZip, exifr, gifenc and tesseract.js.
+## Privacy and security
+
+- Images are decoded, edited and encoded in the browser tab. Nothing is uploaded.
+- Third-party libraries (qrcode-generator, jsQR, JSZip, exifr, gifenc, tesseract.js) are served from this site's [vendor/](vendor/) folder and load only when a tool needs them. No web fonts or analytics are loaded.
+- The one outside request is OCR: on first use it downloads Tesseract's worker, WASM engine and language data (about 2–10 MB) from cdn.jsdelivr.net. The OCR panel says so before you run it.
+- A Content-Security-Policy restricts scripts to this site plus jsDelivr (for OCR only), and blocks plugins, forms and base-URL changes.
+- Shared recipe links are validated: unknown tools and malformed values are dropped, and numbers are clamped to each control's range.
+- Add `?debug=1` to the URL to expose `window.PF` for debugging.

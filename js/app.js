@@ -1,10 +1,10 @@
 import * as C from './core.js';
-import { h, $, $$, toast, download, copyText, pickFiles, fileToCanvas, canvasToBlob } from './dom.js';
+import { h, $, $$, toast, ask, download, copyText, pickFiles, fileToCanvas, canvasToBlob, gifFrames } from './dom.js';
 import { CATEGORIES, TOOLS, getTool, FEATURED, searchTools } from './registry.js';
 import { defaults } from './params.js';
 import { buildControls } from './controls.js';
-import { ratioOf } from './tools/transform.js';
-import { fmtBytes } from './meta.js';
+import { ratioOf, MAX_SIDE } from './tools/transform.js';
+import { fmtBytes, gifFrameCount } from './meta.js';
 import { LIBS } from './libs.js';
 
 /* ============================== state ============================== */
@@ -63,30 +63,62 @@ function setOriginal(canvas, file, { keepStack = false } = {}) {
   if (!S.active) renderToolPanel();
   renderSteps(); requestRender(); updateHeader();
 }
+const IMAGE_EXT = /\.(png|jpe?g|jfif|gif|webp|avif|svg|bmp|ico|heic|heif|tiff?|jxl)$/i;
+const isImageFile = (f) => f && (f.type.startsWith('image/') || IMAGE_EXT.test(f.name));
+async function confirmReplace() {
+  if (!S.stack.length) return 'replace';
+  return ask({
+    title: 'Replace the current image?',
+    body: `You have ${S.stack.length} step${S.stack.length > 1 ? 's' : ''} applied. You can discard them, or keep them and run them on the new image. Undo (⌘Z) brings the old image back either way.`,
+    buttons: [{ label: 'Cancel', value: null }, { label: 'Keep steps', value: 'keep' }, { label: 'Discard steps', value: 'replace', primary: true }],
+  });
+}
 async function openFile(file) {
   if (!file) return;
-  if (!file.type.startsWith('image/') && !/\.(heic|heif|avif|webp|jxl|bmp|ico|tiff?)$/i.test(file.name)) return toast('That doesn’t look like an image', 'err');
+  if (!isImageFile(file)) return toast(`“${file.name}” isn’t an image file.`, 'err', 4000);
+  if (file.size === 0) return toast(`“${file.name}” is empty (0 bytes).`, 'err', 4000);
+  const choice = await confirmReplace();
+  if (!choice) return;
   setBusy('Opening ' + file.name + '…');
   try {
     const bytes = new Uint8Array(await file.arrayBuffer());
     const canvas = await fileToCanvas(file);
-    if (canvas.width * canvas.height > 120e6) toast('Very large image — previews use a reduced copy, exports stay full-size.', 'info', 4000);
-    setOriginal(canvas, { name: file.name, type: file.type, size: file.size, bytes });
+    if (!canvas.width || !canvas.height) throw new Error('no pixels');
+    if (canvas.width * canvas.height > 120e6) toast('Very large image: previews use a reduced copy, exports stay full-size.', 'info', 4000);
+    setOriginal(canvas, { name: file.name, type: file.type, size: file.size, bytes }, { keepStack: choice === 'keep' });
     if (S.active && S.active.tool.kind === 'panel') openTool(S.active.tool.id);
-    toast(`Opened ${canvas.width} × ${canvas.height}`, 'ok');
+    const frames = gifFrameCount(bytes);
+    if (frames > 1) {
+      toast(`This GIF has ${frames} frames. Only the first frame was opened, so edits and exports are single-frame.`, 'warn', 9000,
+        { label: 'Edit as animation', run: () => openGifInMaker(file) });
+    } else toast(`Opened ${canvas.width} × ${canvas.height}`, 'ok');
   } catch (e) {
     console.error(e);
-    toast('Could not decode this image in your browser (' + (file.type || 'unknown type') + ')', 'err', 4000);
+    toast(`Couldn’t read “${file.name}”. The file may be corrupt, or in a format this browser can’t decode${file.type ? ' (' + file.type + ')' : ''}.`, 'err', 5000);
   } finally { setBusy(false); }
+}
+async function openGifInMaker(file) {
+  const frames = await gifFrames(file);
+  if (!frames) return toast('This browser can’t split GIF frames. Try Chrome or Edge, or add frames as separate images.', 'err', 5000);
+  S.pendingGif = { frames, name: file.name };
+  openTool('gif');
 }
 function openCanvasAsNew(canvas, name = 'image') {
   setOriginal(canvas, { name: name + '.png', type: 'image/png', size: null, bytes: null });
 }
 
 /* ============================== render pipeline ============================== */
-async function runTool(tool, src, params, s) {
-  return await tool.run(src, params, { s });
+const warned = new Map();
+function warnOnce(msg) {
+  const now = Date.now();
+  if (now - (warned.get(msg) || 0) < 4000) return;
+  warned.set(msg, now);
+  toast(msg, 'warn', 4000);
 }
+async function runTool(tool, src, params, s) {
+  return await tool.run(src, params, { s, warn: warnOnce });
+}
+const currentReal = () => realDims(S.cache[S.stack.length - 1] || S.proxy);
 async function stackOutput(n) {
   let cur = S.proxy;
   let i = 0;
@@ -108,13 +140,16 @@ let renderToken = 0, renderQueued = false;
 function requestRender() {
   if (renderQueued) return;
   renderQueued = true;
-  requestAnimationFrame(() => { renderQueued = false; render(); });
+  // rAF batches slider drags; the timeout keeps rendering working in background/throttled tabs
+  const go = () => { if (!renderQueued) return; renderQueued = false; render(); };
+  requestAnimationFrame(go);
+  setTimeout(go, 80);
 }
 async function render() {
   const token = ++renderToken;
   const A = S.active;
   const t0 = performance.now();
-  const busyTimer = setTimeout(() => token === renderToken && setBusy('Rendering…', true), 160);
+  const busyTimer = setTimeout(() => { if (token === renderToken) { setBusy('Rendering…', true); els.viewport.classList.add('stale'); } }, 160);
   try {
     let out, before;
     if (A && A.tool.isGenerator) {
@@ -149,7 +184,7 @@ async function render() {
     toast('Render error: ' + e.message, 'err');
   } finally {
     clearTimeout(busyTimer);
-    if (token === renderToken) setBusy(false);
+    if (token === renderToken) { setBusy(false); els.viewport.classList.remove('stale'); }
   }
 }
 
@@ -426,7 +461,7 @@ function closeTool(rerender = true) {
   renderToolPanel(); renderToolList(); renderSteps();
   if (rerender) requestRender();
 }
-function openTool(id, { editIndex = null } = {}) {
+async function openTool(id, { editIndex = null } = {}) {
   const tool = getTool(id);
   if (!tool) return;
   if (S.panelCleanup) { try { S.panelCleanup(); } catch {} S.panelCleanup = null; }
@@ -438,6 +473,7 @@ function openTool(id, { editIndex = null } = {}) {
   }
   const params = editIndex != null ? cloneParams(S.stack[editIndex].params) : defaults(tool);
   if (tool.overlay === 'crop' && editIndex == null) Object.assign(params, { x: 0, y: 0, w: 100, h: 100 });
+  if (tool.init && editIndex == null && S.original) { await stackOutput(S.stack.length); tool.init(params, { realSize: currentReal() }); }
   S.active = { tool, params, editIndex };
   S.recent = [id, ...S.recent.filter((x) => x !== id)].slice(0, 12); LS.set('recent', S.recent);
   setTab('tool');
@@ -458,6 +494,7 @@ function panelApi() {
     openAsNew: (c, name) => { closeTool(false); openCanvasAsNew(c, name); },
     pickColor: startPicking,
     baseName,
+    takePendingGif: () => { const g = S.pendingGif; S.pendingGif = null; return g; },
   };
 }
 function renderToolPanel() {
@@ -491,7 +528,8 @@ function renderToolPanel() {
     return;
   }
   const controls = buildControls(t, A.params, (key) => {
-    if (t.overlay === 'crop' && key === 'aspect') fitCropAspect(A.params), controls.sync();
+    if (t.overlay === 'crop' && key === 'aspect') fitCropAspect(A.params);
+    if (t.normalize) { t.normalize(A.params); controls.sync(); }
     if (t.overlay === 'crop') { renderOverlay(); return; }
     if (t.isGenerator && (key === 'W' || key === 'H')) S.view.fit = true;
     requestRender();
@@ -518,6 +556,9 @@ async function applyActive() {
     } finally { setBusy(false); }
     return;
   }
+  if (A.tool.normalize) A.tool.normalize(A.params);
+  const problem = A.tool.validate && A.tool.validate(A.params, { realSize: realDims(S.current || S.proxy) });
+  if (problem) { toast(problem, 'err', 4000); return; }
   pushUndo();
   if (A.editIndex != null) {
     S.stack[A.editIndex].params = cloneParams(A.params);
@@ -534,7 +575,7 @@ function flashEmpty() { els.empty.classList.remove('flash'); void els.empty.offs
 function summarize(st) {
   const t = getTool(st.id);
   if (!t) return '';
-  return (t.params || []).filter((p) => p.type === 'range' || p.type === 'select').slice(0, 3).map((p) => {
+  return (t.params || []).filter((p) => (p.type === 'range' || p.type === 'select' || p.type === 'number') && (!p.when || p.when(st.params))).slice(0, 3).map((p) => {
     const v = st.params[p.key];
     if (p.type === 'select') return (p.options.find((o) => o[0] === v) || [v, v])[1];
     return `${p.label.split('·').pop().trim()} ${Math.round(v * 10) / 10}${p.unit?.trim().startsWith('%') ? '%' : ''}`;
@@ -584,10 +625,28 @@ async function flatten() {
   try { const full = await renderFull(); const steps = S.stack; setOriginal(full, S.file); S.stack = []; renderSteps(); toast(`Flattened ${steps.length} steps`, 'ok'); }
   finally { setBusy(false); }
 }
+/** Validate untrusted recipe data (from links or storage): returns a clean step array. */
+function sanitizeSteps(steps) {
+  if (!Array.isArray(steps)) return [];
+  return steps.slice(0, 50).filter((st) => st && typeof st === 'object' && typeof st.id === 'string' && getTool(st.id) && !getTool(st.id).isGenerator && getTool(st.id).kind !== 'panel').map((st) => {
+    const tool = getTool(st.id), params = {}, raw = st.params && typeof st.params === 'object' ? st.params : {};
+    for (const p of tool.params || []) {
+      const v = raw[p.key];
+      if (v === undefined) continue;
+      if ((p.type === 'range' || p.type === 'number' || p.type === 'seed') && Number.isFinite(+v)) params[p.key] = p.min != null ? Math.min(p.max, Math.max(p.min, +v)) : +v;
+      else if (p.type === 'select' && p.options.some((o) => o[0] === v)) params[p.key] = v;
+      else if (p.type === 'bool') params[p.key] = !!v;
+      else if ((p.type === 'text' || p.type === 'color') && typeof v === 'string') params[p.key] = v.slice(0, 2000);
+      else if (p.type === 'curve' && Array.isArray(v) && v.length >= 2 && v.length <= 32 && v.every((q) => Array.isArray(q) && q.length === 2 && q.every(Number.isFinite))) params[p.key] = v.map((q) => q.map((n) => Math.min(255, Math.max(0, n))));
+    }
+    return { id: st.id, on: st.on !== false, params };
+  });
+}
 const serializable = (stack) => stack.map((s) => ({ id: s.id, on: s.on, params: Object.fromEntries(Object.entries(s.params).map(([k, v]) => [k, v instanceof HTMLCanvasElement ? null : v])) }));
-function saveRecipe() {
-  const name = prompt('Name this recipe:', `Recipe ${(LS.get('recipes', []).length || 0) + 1}`);
-  if (!name) return;
+async function saveRecipe() {
+  const r = await ask({ title: 'Save recipe', body: 'Saved recipes live in this browser and can be applied to any image.', input: { value: `Recipe ${(LS.get('recipes', []).length || 0) + 1}` }, buttons: [{ label: 'Cancel', value: null }, { label: 'Save', value: true, primary: true }] });
+  if (!r || !r.text) return;
+  const name = r.text.slice(0, 80);
   const recipes = LS.get('recipes', []);
   recipes.unshift({ name, steps: serializable(S.stack), at: Date.now() });
   LS.set('recipes', recipes.slice(0, 50)); renderSteps(); toast('Recipe saved', 'ok');
@@ -599,14 +658,15 @@ function shareRecipe() {
 }
 function applyRecipe(steps) {
   if (!S.original) return toast('Open an image first', 'err');
+  const valid = sanitizeSteps(steps);
+  if (!valid.length) return toast('This recipe has no usable steps.', 'err');
   pushUndo();
-  const valid = steps.filter((s) => getTool(s.id));
   valid.forEach((s) => S.stack.push({ uid: uid++, id: s.id, on: s.on !== false, params: { ...defaults(getTool(s.id)), ...s.params } }));
   invalidate(S.stack.length - valid.length); renderSteps(); requestRender();
   toast(`Applied ${valid.length} steps`, 'ok');
 }
 function renderRecipes(P) {
-  const recipes = LS.get('recipes', []);
+  const recipes = LS.get('recipes', []).filter((r) => r && typeof r.name === 'string' && Array.isArray(r.steps));
   const builtins = [
     { name: '📸 Quick fix', steps: [{ id: 'auto-levels', params: {} }, { id: 'vibrance', params: { v: 30 } }, { id: 'sharpen', params: { amt: 80 } }] },
     { name: '🎞 Film look', steps: [{ id: 'matte', params: {} }, { id: 'split-tone', params: {} }, { id: 'grain', params: { amt: 18 } }, { id: 'vignette', params: { amt: 35 } }] },
@@ -623,14 +683,23 @@ function renderRecipes(P) {
 }
 
 /* ============================== export ============================== */
-const FORMATS = [['image/jpeg', 'JPEG', 'jpg'], ['image/png', 'PNG', 'png'], ['image/webp', 'WebP', 'webp'], ['image/avif', 'AVIF', 'avif']];
-const supported = FORMATS.filter(([m]) => { try { const c = document.createElement('canvas'); c.width = c.height = 1; return c.toDataURL(m).startsWith('data:' + m); } catch { return false; } });
+const FORMATS = [['image/jpeg', 'JPEG', 'jpg'], ['image/png', 'PNG', 'png'], ['image/webp', 'WebP', 'webp'], ['image/avif', 'AVIF', 'avif'], ['image/gif', 'GIF', 'gif']];
+const supported = FORMATS.filter(([m]) => { if (m === 'image/gif') return true; try { const c = document.createElement('canvas'); c.width = c.height = 1; return c.toDataURL(m).startsWith('data:' + m); } catch { return false; } });
 const EX = Object.assign({ type: 'image/jpeg', q: 90, target: false, kb: 300, scale: 100, maxSide: 0, bg: '#ffffff', name: '' }, LS.get('export', {}));
 async function encode(canvas, opts, onStep) {
   let c = canvas;
   if (opts.scale !== 100) c = C.resizeCanvas(c, (c.width * opts.scale) / 100, (c.height * opts.scale) / 100);
   if (opts.maxSide && Math.max(c.width, c.height) > opts.maxSide) { const k = opts.maxSide / Math.max(c.width, c.height); c = C.resizeCanvas(c, c.width * k, c.height * k); }
   if (opts.type === 'image/jpeg') c = C.draw(c.width, c.height, (x) => { x.fillStyle = opts.bg; x.fillRect(0, 0, c.width, c.height); x.drawImage(c, 0, 0); });
+  if (opts.type === 'image/gif') {
+    const { GIFEncoder, quantize, applyPalette } = await LIBS.gifenc();
+    const d = C.readData(c).data, transparent = C.hasAlpha(c);
+    const pal = quantize(d, 256, { format: transparent ? 'rgba4444' : 'rgb565', oneBitAlpha: transparent });
+    const enc = GIFEncoder();
+    enc.writeFrame(applyPalette(d, pal, transparent ? 'rgba4444' : 'rgb565'), c.width, c.height, { palette: pal, transparent, transparentIndex: transparent ? pal.findIndex((p) => p[3] === 0) : 0 });
+    enc.finish();
+    return { blob: new Blob([enc.bytes()], { type: 'image/gif' }), w: c.width, h: c.height, q: null };
+  }
   const lossy = opts.type !== 'image/png';
   if (!opts.target || !lossy) return { blob: await canvasToBlob(c, opts.type, opts.q / 100), w: c.width, h: c.height, q: lossy ? opts.q : null };
   const goal = opts.kb * 1024;
@@ -655,15 +724,21 @@ function renderExport() {
   if (!supported.find(([m]) => m === EX.type)) EX.type = 'image/png';
   const save = () => LS.set('export', { ...EX, name: '' });
   const real = realDims(S.cache[S.stack.length - 1] || S.proxy);
-  const fmtSeg = h('div.seg', {}, supported.map(([m, l]) => h('button', { class: EX.type === m ? 'on' : '', onClick: () => { EX.type = m; save(); renderExport(); } }, l)));
+  const lossyType = EX.type !== 'image/png' && EX.type !== 'image/gif';
+  const fmtSeg = h('div.seg.wrap', {}, supported.map(([m, l]) => h('button', { class: EX.type === m ? 'on' : '', onClick: () => { EX.type = m; save(); renderExport(); } }, l)));
   const q = h('input', { type: 'range', min: 1, max: 100, value: EX.q }), qv = h('span.valbox', {}, EX.q);
   q.addEventListener('input', () => { EX.q = +q.value; qv.textContent = q.value; save(); });
   const tgt = h('input', { type: 'checkbox', checked: EX.target }), kb = h('input.num.wide', { type: 'number', min: 5, max: 50000, value: EX.kb });
-  tgt.addEventListener('change', () => { EX.target = tgt.checked; save(); renderExport(); }); kb.addEventListener('change', () => { EX.kb = +kb.value; save(); });
+  tgt.addEventListener('change', () => { EX.target = tgt.checked; save(); renderExport(); }); kb.addEventListener('change', () => { EX.kb = Math.min(50000, Math.max(5, Math.round(+kb.value) || 300)); kb.value = EX.kb; save(); });
   const sc = h('input', { type: 'range', min: 5, max: 200, value: EX.scale }), scv = h('span.valbox', {}, `${EX.scale}% → ${Math.round(real[0] * EX.scale / 100)} × ${Math.round(real[1] * EX.scale / 100)}`);
   sc.addEventListener('input', () => { EX.scale = +sc.value; scv.textContent = `${EX.scale}% → ${Math.round(real[0] * EX.scale / 100)} × ${Math.round(real[1] * EX.scale / 100)}`; save(); });
   const ms = h('input.num.wide', { type: 'number', min: 0, max: 20000, value: EX.maxSide, placeholder: 'none' });
-  ms.addEventListener('change', () => { EX.maxSide = +ms.value || 0; save(); });
+  ms.addEventListener('change', () => {
+    const raw = Math.round(+ms.value);
+    const v = Number.isFinite(raw) ? Math.min(MAX_SIDE, Math.max(0, raw)) : 0;
+    if (v !== raw) toast(raw > MAX_SIDE ? `Longest side is limited to ${MAX_SIDE} px.` : 'Use 0 (off) or a positive number of pixels.', 'warn');
+    EX.maxSide = v; ms.value = v; save();
+  });
   const bg = h('input', { type: 'color', value: EX.bg }); bg.addEventListener('input', () => { EX.bg = bg.value; save(); });
   const ext = (FORMATS.find((f) => f[0] === EX.type) || [])[2];
   const name = h('input.text', { value: EX.name || baseName() + (S.stack.length ? '-edited' : '') });
@@ -685,9 +760,9 @@ function renderExport() {
   };
   P.append(...[
     h('div.field', {}, h('span.label', {}, 'Format'), fmtSeg),
-    EX.type !== 'image/png' ? h('label.field.range', {}, h('div.field-head', {}, h('span.label', {}, 'Quality'), qv), q) : h('p.muted.small', {}, 'PNG is lossless. Use WebP/JPEG for smaller files.'),
-    EX.type !== 'image/png' ? h('label.field.toggle', {}, tgt, h('span.switch'), h('span.label', {}, 'Compress to a target file size')) : null,
-    EX.target && EX.type !== 'image/png' ? h('label.field', {}, h('span.label', {}, 'Max file size (KB)'), kb) : null,
+    lossyType ? h('label.field.range', {}, h('div.field-head', {}, h('span.label', {}, 'Quality'), qv), q) : h('p.muted.small', {}, EX.type === 'image/gif' ? 'GIF is limited to 256 colors and a single frame here. Use GIF Animation Maker for animations.' : 'PNG is lossless. Use WebP/JPEG for smaller files.'),
+    lossyType ? h('label.field.toggle', {}, tgt, h('span.switch'), h('span.label', {}, 'Compress to a target file size')) : null,
+    EX.target && lossyType ? h('label.field', {}, h('span.label', {}, 'Max file size (KB)'), kb) : null,
     h('label.field.range', {}, h('div.field-head', {}, h('span.label', {}, 'Scale'), scv), sc),
     h('label.field', {}, h('span.label', {}, 'Limit longest side (px, 0 = off)'), ms),
     EX.type === 'image/jpeg' ? h('div.field', {}, h('span.label', {}, 'Background for transparent areas'), h('div.color-row', {}, bg)) : null,
@@ -700,7 +775,7 @@ function renderExport() {
       } }, 'Copy'),
       h('button.btn.primary', { onClick: async () => { const r = await doEncode(); if (r) { download(r.blob, `${name.value || 'image'}.${ext}`); toast('Downloaded ' + fmtBytes(r.blob.size), 'ok'); } } }, 'Download')),
     result,
-    h('p.muted.small', {}, '🔒 Everything runs locally in your browser. Exported files contain no EXIF/GPS metadata.'),
+    h('p.muted.small', {}, '🔒 Encoding happens in your browser, and the image is never uploaded. Exported files contain no EXIF/GPS metadata.'),
     h('hr'),
     h('h4', {}, 'Batch process'),
     h('p.muted.small', {}, S.stack.length ? `Apply these ${S.stack.length} step(s) + export settings to many files at once and get a ZIP.` : 'Apply some steps first, then run them on many files at once.'),
@@ -795,7 +870,7 @@ function openPalette() {
     { name: 'Toggle light / dark theme', run: toggleTheme },
     { name: 'Keyboard shortcuts', run: showShortcuts, kb: '?' },
   ];
-  let sel = 0, items = [];
+  let sel = -1, items = [];
   const draw = () => {
     const q = input.value.toLowerCase().trim();
     const tools = searchTools(q).slice(0, 40).map((t) => ({ name: t.name, sub: CATEGORIES.find((c) => c.id === t.cat)?.name, run: () => openTool(t.id) }));
@@ -803,20 +878,28 @@ function openPalette() {
     items = q ? [...tools, ...acts] : [...acts.slice(0, 3), ...tools];
     sel = Math.min(sel, items.length - 1);
     list.innerHTML = '';
+    if (!items.length) list.append(h('p.muted.pad', {}, `No tools or actions match “${input.value.trim()}”. Try “blur”, “text”, “gif” or “exif”.`));
     items.forEach((it, i) => list.append(h('button.palette-item', { class: i === sel ? 'sel' : '', onClick: () => { close(); it.run(); }, onMouseMove: () => { if (sel !== i) { sel = i; draw(); } } }, h('span', {}, it.name), h('small.muted', {}, it.sub || ''), it.kb ? h('kbd', {}, it.kb) : null)));
     list.querySelector('.sel')?.scrollIntoView({ block: 'nearest' });
   };
-  input.addEventListener('input', () => { sel = 0; draw(); });
+  input.addEventListener('input', () => { sel = input.value.trim() ? 0 : -1; draw(); });
   input.addEventListener('keydown', (e) => {
     if (e.key === 'ArrowDown') { sel = Math.min(items.length - 1, sel + 1); draw(); e.preventDefault(); }
     if (e.key === 'ArrowUp') { sel = Math.max(0, sel - 1); draw(); e.preventDefault(); }
-    if (e.key === 'Enter' && items[sel]) { close(); items[sel].run(); }
+    if (e.key === 'Enter' && sel >= 0 && items[sel]) { e.preventDefault(); close(); items[sel].run(); }
     if (e.key === 'Escape') close();
   });
   const modal = h('div.modal-back', { onClick: (e) => { if (e.target === modal) close(); } }, h('div.modal.palette', {}, input, list));
   const close = () => modal.remove();
   document.body.append(modal);
   draw(); input.focus();
+}
+function showPrivacy() {
+  ask({
+    title: 'How privacy works',
+    body: 'Your images are decoded, edited and encoded inside this browser tab, and are never uploaded anywhere. The page and its libraries (QR, ZIP, EXIF, GIF) load from this site. The one exception is OCR: the first time you run it, it downloads its engine and language data (about 2–10 MB) from cdn.jsdelivr.net. Even then, your image stays on your device.',
+    buttons: [{ label: 'Got it', value: true, primary: true }],
+  });
 }
 function showShortcuts() {
   const rows = [['⌘K or /', 'Search tools & actions'], ['⌘O', 'Open image'], ['⌘V', 'Paste image'], ['⌘S', 'Export'], ['Enter', 'Apply current tool'], ['Esc', 'Cancel tool'], ['⌘Z / ⇧⌘Z', 'Undo / redo'], ['\\ (hold)', 'Show before'], ['C', 'Before/after split'], ['G', 'Effects gallery'], ['F / double-click', 'Fit to screen'], ['1', 'Zoom 100%'], ['+ / −', 'Zoom in / out'], ['⌘/Ctrl + scroll, pinch', 'Zoom'], ['Drag', 'Pan']];
@@ -886,16 +969,18 @@ function wire() {
   window.addEventListener('dragover', (e) => e.preventDefault());
   window.addEventListener('drop', (e) => {
     e.preventDefault(); dragDepth = 0; document.body.classList.remove('dropping');
-    const f = [...(e.dataTransfer?.files || [])].find((x) => x.type.startsWith('image/') || /\.(heic|avif|webp)$/i.test(x.name));
+    const files = [...(e.dataTransfer?.files || [])];
+    const f = files.find(isImageFile);
     if (f) openFile(f);
+    else if (files.length) toast(files.length === 1 ? `“${files[0].name}” isn’t an image file.` : 'None of the dropped files are images.', 'err', 4000);
   });
   window.addEventListener('paste', (e) => {
-    if (e.target.closest('input, textarea')) return;
+    if (e.target.closest?.('input, textarea')) return;
     const item = [...(e.clipboardData?.items || [])].find((i) => i.type.startsWith('image/'));
     if (item) { const f = item.getAsFile(); openFile(new File([f], 'pasted-image.png', { type: f.type })); }
   });
   window.addEventListener('keydown', (e) => {
-    const typing = e.target.closest('input, textarea, select');
+    const typing = e.target.closest?.('input, textarea, select');
     const mod = e.metaKey || e.ctrlKey;
     if (mod && e.key.toLowerCase() === 'k') { e.preventDefault(); openPalette(); return; }
     if (mod && e.key.toLowerCase() === 'o') { e.preventDefault(); pickFiles().then(([f]) => openFile(f)); return; }
@@ -925,13 +1010,16 @@ function boot() {
   const m = location.hash.match(/recipe=([^&]+)/);
   if (m) {
     try {
-      const steps = JSON.parse(decodeURIComponent(escape(atob(m[1]))));
+      const steps = sanitizeSteps(JSON.parse(decodeURIComponent(escape(atob(m[1])))));
+      if (!steps.length) throw new Error('empty');
       const recipes = LS.get('recipes', []);
       recipes.unshift({ name: 'Shared recipe', steps, at: Date.now() }); LS.set('recipes', recipes);
-      history.replaceState(null, '', location.pathname);
+      history.replaceState(null, '', location.pathname + location.search);
       renderSteps(); toast('Shared recipe added — open an image and apply it from Steps', 'ok', 4500);
     } catch { toast('Invalid recipe link', 'err'); }
   }
-  window.PF = { S, openTool, openFile, openCanvasAsNew, TOOLS, render, renderFull }; // debugging hook
+  if (new URLSearchParams(location.search).has('debug')) window.PF = { S, openTool, openFile, openCanvasAsNew, TOOLS, render, renderFull };
+  $$('button[title]:not([aria-label])').forEach((b) => b.setAttribute('aria-label', b.title));
+  $('#privacy-link')?.addEventListener('click', (e) => { e.preventDefault(); showPrivacy(); });
 }
 boot();

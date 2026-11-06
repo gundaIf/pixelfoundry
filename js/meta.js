@@ -138,3 +138,26 @@ export function fmtBytes(n) {
   if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
   return (n / 1024 / 1024).toFixed(2) + ' MB';
 }
+
+export const isGif = (b) => b && b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46;
+/** Count frames in a GIF by walking its block structure. Returns 0 if not a valid GIF. */
+export function gifFrameCount(b) {
+  if (!isGif(b) || b.length < 13) return 0;
+  let i = 13, frames = 0;
+  if (b[10] & 0x80) i += 3 * (1 << ((b[10] & 7) + 1));
+  const skipSub = () => { while (i < b.length && b[i] !== 0) i += b[i] + 1; i++; };
+  while (i < b.length) {
+    const t = b[i];
+    if (t === 0x3b) break;
+    if (t === 0x21) { i += 2; skipSub(); }
+    else if (t === 0x2c) {
+      frames++;
+      const packed = b[i + 9];
+      i += 10;
+      if (packed & 0x80) i += 3 * (1 << ((packed & 7) + 1));
+      i++; // LZW min code size
+      skipSub();
+    } else break;
+  }
+  return frames;
+}

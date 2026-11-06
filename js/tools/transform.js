@@ -58,6 +58,18 @@ function drawTextBlock(x, str, font, size, lineH = 1.2) {
   return { lines, w: Math.max(...widths, 1), h: lines.length * size * lineH, lineH: size * lineH };
 }
 
+/** Keep a crop box inside the image: 0 ≤ x, x + w ≤ 100 (same for y/h), min size 0.5%. Mutates and returns p. */
+export function normalizeCrop(p) {
+  const num = (v, d) => (Number.isFinite(+v) ? +v : d);
+  p.w = Math.min(100, Math.max(0.5, num(p.w, 100)));
+  p.h = Math.min(100, Math.max(0.5, num(p.h, 100)));
+  p.x = Math.min(100 - p.w, Math.max(0, num(p.x, 0)));
+  p.y = Math.min(100 - p.h, Math.max(0, num(p.y, 0)));
+  return p;
+}
+export const MAX_SIDE = 16000;
+export const MAX_PIXELS = 120e6;
+
 export function rotateCanvas(src, deg, expand = true, bg = null, fill = false) {
   const a = (deg * Math.PI) / 180, w = src.width, h = src.height, c = Math.abs(Math.cos(a)), s = Math.abs(Math.sin(a));
   let W = w, H = h, sc = 1;
@@ -75,13 +87,17 @@ export default [
   {
     id: 'resize', name: 'Resize', cat, tags: 'scale dimensions pixels megapixels percent shrink',
     desc: 'Resize by pixels, percentage, longest side or megapixels with high-quality resampling.',
+    init: (p, ctx) => {
+      const [W, H] = ctx.realSize;
+      Object.assign(p, { w: W, h: H, long: Math.max(W, H), mp: Math.round((W * H) / 1e5) / 10 || 0.1 });
+    },
     params: [
       select('mode', 'Resize by', [['px', 'Width × height'], ['w', 'Width (keep ratio)'], ['h', 'Height (keep ratio)'], ['long', 'Longest side'], ['pct', 'Percentage'], ['mp', 'Megapixels']], 'w'),
-      when((p) => p.mode === 'px' || p.mode === 'w', num('w', 'Width (px)', 1, 20000, 1200)),
-      when((p) => p.mode === 'px' || p.mode === 'h', num('h', 'Height (px)', 1, 20000, 800)),
-      when((p) => p.mode === 'long', num('long', 'Longest side (px)', 1, 20000, 1600)),
+      when((p) => p.mode === 'px' || p.mode === 'w', num('w', 'Width (px)', 1, MAX_SIDE, 1200)),
+      when((p) => p.mode === 'px' || p.mode === 'h', num('h', 'Height (px)', 1, MAX_SIDE, 800)),
+      when((p) => p.mode === 'long', num('long', 'Longest side (px)', 1, MAX_SIDE, 1600)),
       when((p) => p.mode === 'pct', range('pct', 'Scale', 1, 400, 50, 1, '%')),
-      when((p) => p.mode === 'mp', range('mp', 'Megapixels', 0.1, 50, 2, 0.1, ' MP')),
+      when((p) => p.mode === 'mp', range('mp', 'Megapixels', 0.1, 100, 2, 0.1, ' MP')),
       when((p) => p.mode === 'px', select('fit', 'Fit', [['stretch', 'Stretch'], ['cover', 'Fill & crop'], ['contain', 'Fit inside (pad)']])),
       when((p) => p.mode === 'px' && p.fit === 'contain', color('pad', 'Padding color', '#ffffff')),
       select('algo', 'Resampling', [['smooth', 'Smooth (high quality)'], ['nearest', 'Nearest (pixel art)']]),
@@ -97,6 +113,9 @@ export default [
         case 'mp': { const k = Math.sqrt((p.mp * 1e6) / (W0 * H0)); W = W0 * k; H = H0 * k; break; }
         default: W = p.w; H = p.h;
       }
+      // keep the output within browser canvas limits
+      const lim = Math.min(1, MAX_SIDE / Math.max(W, H), Math.sqrt(MAX_PIXELS / (W * H)));
+      if (lim < 1) { W *= lim; H *= lim; env.warn && env.warn(`Output limited to ${Math.round(W)} × ${Math.round(H)} px (browser canvas limit).`); }
       const smooth = p.algo === 'smooth', w = Math.max(1, Math.round(W)) * env.s, h = Math.max(1, Math.round(H)) * env.s;
       if (p.mode !== 'px' || p.fit === 'stretch') return C.resizeCanvas(src, w, h, smooth);
       const k = p.fit === 'cover' ? Math.max(w / src.width, h / src.height) : Math.min(w / src.width, h / src.height);
@@ -112,10 +131,18 @@ export default [
     id: 'crop', name: 'Crop', cat, tags: 'cut trim aspect ratio',
     desc: 'Drag the box on the image (or type values) to crop. Lock to common aspect ratios.',
     overlay: 'crop',
-    params: [select('aspect', 'Aspect ratio', ASPECTS), range('x', 'Left', 0, 100, 0, 0.1, '%'), range('y', 'Top', 0, 100, 0, 0.1, '%'), range('w', 'Width', 1, 100, 100, 0.1, '%'), range('h', 'Height', 1, 100, 100, 0.1, '%')],
+    params: [select('aspect', 'Aspect ratio', ASPECTS), range('x', 'Left', 0, 100, 0, 0.1, '%'), range('y', 'Top', 0, 100, 0, 0.1, '%'), range('w', 'Width', 0.5, 100, 100, 0.1, '%'), range('h', 'Height', 0.5, 100, 100, 0.1, '%')],
+    normalize: normalizeCrop,
+    validate: (p, ctx) => {
+      const [W, H] = ctx.realSize;
+      const w = Math.round((p.w / 100) * W), h = Math.round((p.h / 100) * H);
+      return w < 2 || h < 2 ? `The crop area is only ${w} × ${h} px. Make it at least 2 × 2 px.` : null;
+    },
     run: (src, p) => {
-      const x = (p.x / 100) * src.width, y = (p.y / 100) * src.height;
-      const w = Math.min(src.width - x, (p.w / 100) * src.width), h = Math.min(src.height - y, (p.h / 100) * src.height);
+      const q = normalizeCrop({ ...p });
+      const x = Math.round((q.x / 100) * src.width), y = Math.round((q.y / 100) * src.height);
+      const w = Math.max(1, Math.min(src.width - x, Math.round((q.w / 100) * src.width)));
+      const h = Math.max(1, Math.min(src.height - y, Math.round((q.h / 100) * src.height)));
       return C.draw(w, h, (c) => c.drawImage(src, -x, -y));
     },
   },
